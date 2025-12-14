@@ -88,6 +88,8 @@
 
 #define DEFAULT_TIMER_PERIOD 2
 #define LG4FF_MAX_EFFECTS 16
+/* Maximum number of frozen axes supported via sysfs */
+#define LG4FF_MAX_FROZEN 8
 
 #define FF_EFFECT_STARTED 0
 #define FF_EFFECT_ALLSET 1
@@ -169,6 +171,11 @@ struct lg4ff_device_entry {
 #ifdef CONFIG_LEDS_CLASS
 	int has_leds;
 #endif
+
+	/* Frozen input mappings: small fixed table of (usage -> value) pairs */
+	int frozen_count;
+	int frozen_usage[LG4FF_MAX_FROZEN];
+	s32 frozen_value[LG4FF_MAX_FROZEN];
 };
 
 static const signed short lg4ff_wheel_effects[] = {
@@ -1165,6 +1172,21 @@ int lg4ff_adjust_input_event(struct hid_device *hid, struct hid_field *field,
 		return 0;
 	}
 
+	/* If a frozen usage mapping exists, override the reported value */
+	{
+		unsigned long _flags;
+		int _i;
+		spin_lock_irqsave(&entry->report_lock, _flags);
+		for (_i = 0; _i < entry->frozen_count; _i++) {
+			if (usage->code == entry->frozen_usage[_i]) {
+				input_event(field->hidinput->input, usage->type, usage->code, entry->frozen_value[_i]);
+				spin_unlock_irqrestore(&entry->report_lock, _flags);
+				return 1;
+			}
+		}
+		spin_unlock_irqrestore(&entry->report_lock, _flags);
+	}
+
 	switch (entry->wdata.product_id) {
 	case USB_DEVICE_ID_LOGITECH_DFP_WHEEL:
 		switch (usage->code) {
@@ -1758,6 +1780,120 @@ static ssize_t lg4ff_combine_store(struct device *dev, struct device_attribute *
 }
 static DEVICE_ATTR(combine_pedals, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH, lg4ff_combine_show, lg4ff_combine_store);
 
+static ssize_t lg4ff_freeze_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct lg4ff_device_entry *entry;
+	size_t cnt = 0;
+	int i;
+	unsigned long flags;
+
+	entry = lg4ff_get_device_entry(hid);
+	if (entry == NULL)
+		return -EINVAL;
+
+	spin_lock_irqsave(&entry->report_lock, flags);
+	if (entry->frozen_count == 0) {
+		cnt = scnprintf(buf, PAGE_SIZE, "none\n");
+	} else {
+		for (i = 0; i < entry->frozen_count; i++) {
+			cnt += scnprintf(buf + cnt, PAGE_SIZE - cnt, "%d %d\n", entry->frozen_usage[i], entry->frozen_value[i]);
+			if (cnt >= PAGE_SIZE - 1)
+				break;
+		}
+	}
+	spin_unlock_irqrestore(&entry->report_lock, flags);
+
+	return cnt;
+}
+
+static ssize_t lg4ff_freeze_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct lg4ff_device_entry *entry;
+	char *lbuf;
+	long u = 0, v = 0;
+	unsigned long flags;
+	int i, idx;
+
+	entry = lg4ff_get_device_entry(hid);
+	if (entry == NULL)
+		return -EINVAL;
+
+	/* Allow \n at the end */
+	lbuf = kasprintf(GFP_KERNEL, "%s", buf);
+	if (!lbuf)
+		return -ENOMEM;
+
+	if (lbuf[strlen(lbuf)-1] == '\n')
+		lbuf[strlen(lbuf)-1] = '\0';
+
+	spin_lock_irqsave(&entry->report_lock, flags);
+
+	if (!strcmp(lbuf, "none") || !strcmp(lbuf, "0")) {
+		entry->frozen_count = 0;
+		for (i = 0; i < LG4FF_MAX_FROZEN; i++)
+			entry->frozen_usage[i] = -1;
+		spin_unlock_irqrestore(&entry->report_lock, flags);
+		kfree(lbuf);
+		return count;
+	}
+
+	/* clear <usage> */
+	if (sscanf(lbuf, "clear %ld", &u) == 1) {
+		int usage = (int)u;
+		idx = -1;
+		for (i = 0; i < entry->frozen_count; i++) {
+			if (entry->frozen_usage[i] == usage) {
+				idx = i;
+				break;
+			}
+		}
+		if (idx >= 0) {
+			for (i = idx; i < entry->frozen_count - 1; i++) {
+				entry->frozen_usage[i] = entry->frozen_usage[i+1];
+				entry->frozen_value[i] = entry->frozen_value[i+1];
+			}
+			entry->frozen_count--;
+		}
+		spin_unlock_irqrestore(&entry->report_lock, flags);
+		kfree(lbuf);
+		return count;
+	}
+
+	if (sscanf(lbuf, "%ld %ld", &u, &v) < 2) {
+		spin_unlock_irqrestore(&entry->report_lock, flags);
+		kfree(lbuf);
+		return -EINVAL;
+	}
+
+	/* Add or update mapping */
+	idx = -1;
+	for (i = 0; i < entry->frozen_count; i++) {
+		if (entry->frozen_usage[i] == (int)u) {
+			idx = i;
+			break;
+		}
+	}
+	if (idx >= 0) {
+		entry->frozen_value[idx] = (s32)v;
+	} else {
+		if (entry->frozen_count >= LG4FF_MAX_FROZEN) {
+			spin_unlock_irqrestore(&entry->report_lock, flags);
+			kfree(lbuf);
+			return -ENOMEM;
+		}
+		entry->frozen_usage[entry->frozen_count] = (int)u;
+		entry->frozen_value[entry->frozen_count] = (s32)v;
+		entry->frozen_count++;
+	}
+
+	spin_unlock_irqrestore(&entry->report_lock, flags);
+	kfree(lbuf);
+	return count;
+}
+static DEVICE_ATTR(freeze_axis, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH, lg4ff_freeze_show, lg4ff_freeze_store);
+
 /* Export the currently set range of the wheel */
 static ssize_t lg4ff_range_show(struct device *dev, struct device_attribute *attr,
 				char *buf)
@@ -2313,6 +2449,11 @@ int lg4ff_init(struct hid_device *hid)
 	entry->report = report;
 	drv_data->device_props = entry;
 
+	/* default: no frozen usage */
+	entry->frozen_count = 0;
+	for (i = 0; i < LG4FF_MAX_FROZEN; i++)
+		entry->frozen_usage[i] = -1;
+
 	/* Check if a multimode wheel has been connected and
 	 * handle it appropriately */
 	mmode_ret = lg4ff_handle_multimode_wheel(hid, &real_product_id, bcdDevice);
@@ -2412,6 +2553,10 @@ int lg4ff_init(struct hid_device *hid)
 	error = device_create_file(&hid->dev, &dev_attr_combine_pedals);
 	if (error)
 		hid_warn(hid, "Unable to create sysfs interface for \"combine\", errno %d\n", error);
+	/* Freeze axis sysfs: write "none" or "0" to disable, or "<usage> <value>" to freeze */
+	error = device_create_file(&hid->dev, &dev_attr_freeze_axis);
+	if (error)
+		hid_warn(hid, "Unable to create sysfs interface for \"freeze_axis\", errno %d\n", error);
 	error = device_create_file(&hid->dev, &dev_attr_range);
 	if (error)
 		hid_warn(hid, "Unable to create sysfs interface for \"range\", errno %d\n", error);
@@ -2520,6 +2665,7 @@ int lg4ff_deinit(struct hid_device *hid)
 	}
 
 	device_remove_file(&hid->dev, &dev_attr_combine_pedals);
+	device_remove_file(&hid->dev, &dev_attr_freeze_axis);
 	device_remove_file(&hid->dev, &dev_attr_range);
 
 	if (test_bit(FF_CONSTANT, dev->ffbit)) {
